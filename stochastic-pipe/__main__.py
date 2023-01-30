@@ -10,9 +10,30 @@ License: LGPLv3+
 """
 import argparse
 import os  # os.path.basename
+import re
 import sys  # sys.stderr.write
+import time
 
 from .. import openpmd_api_cxx as io
+
+
+class DumpTimes:
+    def __init__(self, filename):
+        self.last_time_point = int(time.time() * 1000)
+        self.out_stream = open(filename, 'w')
+
+    def close(self):
+        self.out_stream.close()
+
+    def now(self, description, separator='\t'):
+        current = int(time.time() * 1000)
+        self.out_stream.write(
+            str(current) + separator + str(current - self.last_time_point) +
+            separator + description + '\n')
+        self.last_time_point = current
+
+    def flush(self):
+        self.out_stream.flush()
 
 
 def parse_args(program_name):
@@ -39,8 +60,13 @@ are fulfilled:
    By default, the openPMD-api will be initialized without an MPI communicator
    if the MPI size is 1. This is to simplify the use of the JSON backend
    which is only available in serial openPMD.
-With parallelization enabled, each dataset will be equally sliced along
-the dimension with the largest extent.
+With parallelization enabled, each dataset will be equally sliced according to
+a chunk distribution strategy which may be selected via the environment variable
+OPENPMD_CHUNK_DISTRIBUTION. Options include "roundrobin", "binpacking",
+"slicedataset" and "hostname_<1>_<2>", where <1> should be replaced with a
+strategy to be applied within a compute node and <2> with a secondary strategy
+in case the hostname strategy does not distribute all chunks.
+The default is `hostname_binpacking_slicedataset`.
 
 Examples:
     {0} --infile simData.h5 --outfile simData_%T.bp
@@ -90,72 +116,13 @@ if io.variants['mpi'] and (args.mpi is None or args.mpi):
 else:
     HAVE_MPI = False
 
-debug = False
+debug = True
 
 
 class FallbackMPICommunicator:
     def __init__(self):
         self.size = 1
         self.rank = 0
-
-
-class Chunk:
-    """
-    A Chunk is an n-dimensional hypercube, defined by an offset and an extent.
-    Offset and extent must be of the same dimensionality (Chunk.__len__).
-    """
-    def __init__(self, offset, extent):
-        assert (len(offset) == len(extent))
-        self.offset = offset
-        self.extent = extent
-
-    def __len__(self):
-        return len(self.offset)
-
-    def slice1D(self, mpi_rank, mpi_size, dimension=None):
-        """
-        Slice this chunk into mpi_size hypercubes along one of its
-        n dimensions. The dimension is given through the 'dimension'
-        parameter. If None, the dimension with the largest extent on
-        this hypercube is automatically picked.
-        Returns the mpi_rank'th of the sliced chunks.
-        """
-        if dimension is None:
-            # pick that dimension which has the highest count of items
-            dimension = 0
-            maximum = self.extent[0]
-            for k, v in enumerate(self.extent):
-                if v > maximum:
-                    dimension = k
-        assert (dimension < len(self))
-        # no offset
-        assert (self.offset == [0 for _ in range(len(self))])
-        offset = [0 for _ in range(len(self))]
-        stride = self.extent[dimension] // mpi_size
-        rest = self.extent[dimension] % mpi_size
-
-        # local function f computes the offset of a rank
-        # for more equal balancing, we want the start index
-        # at the upper gaussian bracket of (N/n*rank)
-        # where N the size of the dataset in dimension dim
-        # and n the MPI size
-        # for avoiding integer overflow, this is the same as:
-        # (N div n)*rank + round((N%n)/n*rank)
-        def f(rank):
-            res = stride * rank
-            padDivident = rest * rank
-            pad = padDivident // mpi_size
-            if pad * mpi_size < padDivident:
-                pad += 1
-            return res + pad
-
-        offset[dimension] = f(mpi_rank)
-        extent = self.extent.copy()
-        if mpi_rank >= mpi_size - 1:
-            extent[dimension] -= offset[dimension]
-        else:
-            extent[dimension] = f(mpi_rank + 1) - offset[dimension]
-        return Chunk(offset, extent)
 
 
 class deferred_load:
@@ -188,6 +155,42 @@ class particle_patch_load:
             self.dest.store(index, item)
 
 
+def distribution_strategy(dataset_extent,
+                          mpi_rank,
+                          mpi_size,
+                          strategy_identifier=None):
+    if strategy_identifier is None or not strategy_identifier:
+        if 'OPENPMD_CHUNK_DISTRIBUTION' in os.environ:
+            strategy_identifier = os.environ[
+                'OPENPMD_CHUNK_DISTRIBUTION'].lower()
+        else:
+            strategy_identifier = 'hostname_binpacking_slicedataset'  # default
+    match = re.search('hostname_(.*)_(.*)', strategy_identifier)
+    if match is not None:
+        inside_node = distribution_strategy(dataset_extent,
+                                            mpi_rank,
+                                            mpi_size,
+                                            strategy_identifier=match.group(1))
+        second_phase = distribution_strategy(
+            dataset_extent,
+            mpi_rank,
+            mpi_size,
+            strategy_identifier=match.group(2))
+        return io.FromPartialStrategy(io.ByHostname(inside_node), second_phase)
+    elif strategy_identifier == 'roundrobin':
+        return io.RoundRobin()
+    elif strategy_identifier == 'binpacking':
+        return io.BinPacking()
+    elif strategy_identifier == 'slicedataset':
+        return io.ByCuboidSlice(io.OneDimensionalBlockSlicer(), dataset_extent,
+                                mpi_rank, mpi_size)
+    elif strategy_identifier == 'fail':
+        return io.FailingStrategy()
+    else:
+        raise RuntimeError("Unknown distribution strategy: " +
+                           strategy_identifier)
+
+
 class pipe:
     """
     Represents the configuration of one "pipe" pass.
@@ -199,12 +202,17 @@ class pipe:
         self.outconfig = outconfig
         self.loads = []
         self.comm = comm
+        if HAVE_MPI:
+            hostinfo = io.HostInfo.HOSTNAME
+            self.outranks = hostinfo.get_collective(self.comm)
+        else:
+            self.outranks = {i: str(i) for i in range(self.comm.size)}
 
-    def run(self):
+    def run(self, loggingfile):
         if not HAVE_MPI or (args.mpi is None and self.comm.size == 1):
             print("Opening data source")
             sys.stdout.flush()
-            inseries = io.Series(self.infile, io.Access.read_linear,
+            inseries = io.Series(self.infile, io.Access.read_only,
                                  self.inconfig)
             print("Opening data sink")
             sys.stdout.flush()
@@ -215,7 +223,7 @@ class pipe:
         else:
             print("Opening data source on rank {}.".format(self.comm.rank))
             sys.stdout.flush()
-            inseries = io.Series(self.infile, io.Access.read_linear, self.comm,
+            inseries = io.Series(self.infile, io.Access.read_only, self.comm,
                                  self.inconfig)
             print("Opening data sink on rank {}.".format(self.comm.rank))
             sys.stdout.flush()
@@ -223,9 +231,13 @@ class pipe:
                                   self.outconfig)
             print("Opened input and output on rank {}.".format(self.comm.rank))
             sys.stdout.flush()
-        self.__copy(inseries, outseries)
+        dump_times = DumpTimes(loggingfile)
+        self.__copy(inseries, outseries, dump_times)
+        dump_times.close()
+        del inseries
+        del outseries
 
-    def __copy(self, src, dest, current_path="/data/"):
+    def __copy(self, src, dest, dump_times, current_path="/data/"):
         """
         Worker method.
         Copies data from src to dest. May represent any point in the openPMD
@@ -263,6 +275,8 @@ class pipe:
             # main loop: read iterations of src, write to dest
             write_iterations = dest.write_iterations()
             for in_iteration in src.read_iterations():
+                dump_times.now("Received iteration {}".format(
+                    in_iteration.iteration_index))
                 if self.comm.rank == 0:
                     print("Iteration {0} contains {1} meshes:".format(
                         in_iteration.iteration_index,
@@ -279,26 +293,36 @@ class pipe:
                         print("With records:")
                         for r in in_iteration.particles[ps]:
                             print("\t {0}".format(r))
+                # With linear read mode, we can only load the source rank table
+                # inside `read_iterations()` since it's a dataset.
+                # For scalability, maybe read mpi_ranks_meta_info in parallel?
+                self.inranks = src.mpi_ranks_meta_info
                 out_iteration = write_iterations[in_iteration.iteration_index]
                 sys.stdout.flush()
                 self.__particle_patches = []
                 self.__copy(
-                    in_iteration, out_iteration,
+                    in_iteration, out_iteration, dump_times,
                     current_path + str(in_iteration.iteration_index) + "/")
                 for deferred in self.loads:
                     deferred.source.load_chunk(
                         deferred.dynamicView.current_buffer(), deferred.offset,
                         deferred.extent)
+                dump_times.now("Closing incoming iteration {}".format(
+                    in_iteration.iteration_index))
                 in_iteration.close()
                 for patch_load in self.__particle_patches:
                     patch_load.run()
+                dump_times.now("Closing outgoing iteration {}".format(
+                    in_iteration.iteration_index))
                 out_iteration.close()
+                dump_times.now("Closed outgoing iteration {}".format(
+                    in_iteration.iteration_index))
+                dump_times.flush()
                 self.__particle_patches.clear()
                 self.loads.clear()
                 sys.stdout.flush()
         elif isinstance(src, io.Record_Component):
             shape = src.shape
-            offset = [0 for _ in shape]
             dtype = src.dtype
             dest.reset_dataset(io.Dataset(dtype, shape))
             if src.empty:
@@ -308,36 +332,43 @@ class pipe:
             elif src.constant:
                 dest.make_constant(src.get_attribute("value"))
             else:
-                chunk = Chunk(offset, shape)
-                local_chunk = chunk.slice1D(self.comm.rank, self.comm.size)
-                if debug:
-                    end = local_chunk.offset.copy()
-                    for i in range(len(end)):
-                        end[i] += local_chunk.extent[i]
-                    print("{}\t{}/{}:\t{} -- {}".format(
-                        current_path, self.comm.rank, self.comm.size,
-                        local_chunk.offset, end))
-                span = dest.store_chunk(local_chunk.offset, local_chunk.extent)
-                self.loads.append(
-                    deferred_load(src, span, local_chunk.offset,
-                                  local_chunk.extent))
+                chunk_table = src.available_chunks()
+                strategy = distribution_strategy(shape, self.comm.rank,
+                                                 self.comm.size)
+                my_chunks = strategy.assign_chunks(chunk_table, self.inranks,
+                                                   self.outranks)
+                for chunk in my_chunks[
+                        self.comm.rank] if self.comm.rank in my_chunks else []:
+                    if debug:
+                        end = chunk.offset.copy()
+                        for i in range(len(end)):
+                            end[i] += chunk.extent[i]
+                        print("{}\t{}/{}:\t{} -- {}".format(
+                            current_path, self.comm.rank, self.comm.size,
+                            chunk.offset, end))
+                    span = dest.store_chunk(chunk.offset, chunk.extent)
+                    self.loads.append(
+                        deferred_load(src, span, chunk.offset, chunk.extent))
         elif isinstance(src, io.Patch_Record_Component):
             dest.reset_dataset(io.Dataset(src.dtype, src.shape))
             if self.comm.rank == 0:
                 self.__particle_patches.append(
                     particle_patch_load(src.load(), dest))
         elif isinstance(src, io.Iteration):
-            self.__copy(src.meshes, dest.meshes, current_path + "meshes/")
-            self.__copy(src.particles, dest.particles,
+            self.__copy(src.meshes, dest.meshes, dump_times,
+                        current_path + "meshes/")
+            self.__copy(src.particles, dest.particles, dump_times,
                         current_path + "particles/")
         elif any([
                 isinstance(src, container_type)
                 for container_type in container_types
         ]):
             for key in src:
-                self.__copy(src[key], dest[key], current_path + key + "/")
+                self.__copy(src[key], dest[key], dump_times,
+                            current_path + key + "/")
             if isinstance(src, io.ParticleSpecies):
-                self.__copy(src.particle_patches, dest.particle_patches)
+                self.__copy(src.particle_patches, dest.particle_patches,
+                            dump_times)
         else:
             raise RuntimeError("Unknown openPMD class: " + str(src))
 
@@ -353,7 +384,17 @@ def main():
     run_pipe = pipe(args.infile, args.outfile, args.inconfig, args.outconfig,
                     communicator)
 
-    run_pipe.run()
+    max_logs = 20
+    stride = (communicator.size + max_logs) // max_logs - 1  # sdiv, ceil(a/b)
+    if stride == 0:
+        stride += 1
+    if communicator.rank % stride == 0:
+        loggingfile = "./PIPE_times_{}.txt".format(communicator.rank)
+    else:
+        loggingfile = "/dev/null"
+    print("Logging file on rank {} of {} is \"{}\".".format(communicator.rank, communicator.size, loggingfile))
+
+    run_pipe.run(loggingfile)
 
 
 if __name__ == "__main__":
