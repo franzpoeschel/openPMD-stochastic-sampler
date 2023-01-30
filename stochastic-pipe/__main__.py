@@ -14,6 +14,7 @@ import re
 import sys  # sys.stderr.write
 import time
 
+import numpy as np
 import openpmd_api as io
 
 
@@ -145,6 +146,31 @@ class loaded_chunks_record_component:
     def append(self, entry: loaded_chunk):
         self.chunks.append(entry)
 
+    def sample(self, sample_size_total, my_out_chunk, random_sample, chunks):
+        # Assert that all chunks are congruent across components
+        assert (len(chunks) == len(self.chunks))
+        for i in range(len(chunks)):
+            assert chunks[i].offset == self.chunks[i].offset
+            assert chunks[i].extent == self.chunks[i].extent
+
+        reset_dataset = True
+        offset = 0
+        for chunk in self.chunks:
+            if reset_dataset:
+                chunk.dest_component.reset_dataset(
+                    io.Dataset(chunk.dest_component.dtype,
+                               [sample_size_total]))
+                reset_dataset = False
+            chunk_len = chunk.extent[0]
+            filter_now = random_sample < chunk_len
+            filter_next = random_sample >= chunk_len
+            filtered = chunk.chunk[random_sample[filter_now]]
+            chunk.dest_component.store_chunk(filtered, [offset],
+                                             [len(filtered)])
+
+            random_sample = random_sample[filter_next] - chunk_len
+            offset += len(filtered)
+
 
 class loaded_chunks_record:
 
@@ -156,13 +182,10 @@ class loaded_chunks_record:
                          loaded_chunks: loaded_chunks_record_component):
         self.components[key] = loaded_chunks
 
-    # @property
-    # def components(self):
-    #     return self._components
-
-    # @components.setter
-    # def components(self, components):
-    #     self._components = components
+    def sample(self, sample_size_total, my_out_chunk, random_sample, chunks):
+        for _, component in self.components.items():
+            component.sample(sample_size_total, my_out_chunk, random_sample,
+                             chunks)
 
 
 class loaded_chunks_species:
@@ -170,10 +193,31 @@ class loaded_chunks_species:
     def __init__(self):
         self.records = {}
         self.chunks = None
+        self.shape = None
 
     # e.g. key = "position", "positionOffset", ...
     def insert_record(self, key: str, record: loaded_chunks_record):
         self.records[key] = record
+
+    def sample(self, communicator, percentage):
+        total_size_this_rank = 0
+        for chunk in self.chunks:
+            assert (len(chunk.offset) == 1 and len(chunk.extent) == 1)
+            total_size_this_rank += chunk.extent[0]
+
+        assert (len(self.shape) == 1)
+        sample_size_per_rank = int(percentage * self.shape[0] /
+                                   communicator.size)
+        sample_size_total = communicator.size * sample_size_per_rank
+
+        my_out_chunk = io.ChunkInfo([communicator.rank * sample_size_per_rank],
+                                    [sample_size_per_rank])
+        random_sample = np.random.choice(range(total_size_this_rank),
+                                         sample_size_per_rank)
+
+        for _, record in self.records.items():
+            record.sample(sample_size_total, my_out_chunk, random_sample,
+                          self.chunks)
 
 
 class loaded_chunks_iteration:
@@ -184,6 +228,10 @@ class loaded_chunks_iteration:
     def insert_particle_species(self, key: str,
                                 particle_species: loaded_chunks_species):
         self.particles[key] = particle_species
+
+    def sample(self, communicator, percentage=0.05):
+        for _, species in self.particles.items():
+            species.sample(communicator, percentage)
 
 
 # class particle_patch_load:
@@ -373,8 +421,9 @@ class pipe:
                 dump_times.now("Closing incoming iteration {}".format(
                     in_iteration.iteration_index))
                 in_iteration.close()
-                # for patch_load in self.__particle_patches:
-                #     patch_load.run()
+                dump_times.now("Sampling iteration {}".format(
+                    in_iteration.iteration_index))
+                loaded_chunks.sample(self.comm)
                 dump_times.now("Closing outgoing iteration {}".format(
                     in_iteration.iteration_index))
                 out_iteration.close()
@@ -390,10 +439,10 @@ class pipe:
             if src.empty:
                 # empty record component automatically created by
                 # dest.reset_dataset()
-                return None
+                return None, shape
             elif src.constant:
                 dest.make_constant(src.get_attribute("value"))
-                return None
+                return None, shape
             else:
                 if not self.__my_chunks__:
                     chunk_table = src.available_chunks()
@@ -417,7 +466,7 @@ class pipe:
                         loaded_chunk(
                             dest, chunk.offset, chunk.extent,
                             src.load_chunk(chunk.offset, chunk.extent)))
-                return loaded_chunks
+                return loaded_chunks, shape
         # elif isinstance(src, io.Patch_Record_Component):
         #     dest.reset_dataset(io.Dataset(src.dtype, src.shape))
         #     if self.comm.rank == 0:
@@ -439,23 +488,24 @@ class pipe:
             res = loaded_chunks_species()
             self.__my_chunks__ = None
             for key in src:
-                item = self.__copy(src[key], dest[key], dump_times,
-                                   current_path + key + "/")
+                item, shape = self.__copy(src[key], dest[key], dump_times,
+                                          current_path + key + "/")
                 if item.components:
                     res.insert_record(key, item)
             # self.__copy(src.particle_patches, dest.particle_patches,
             #                 dump_times)
             res.chunks = self.__my_chunks__
+            res.shape = shape
             self.__my_chunks__ = None
             return res
         elif isinstance(src, io.Record):
             res = loaded_chunks_record()
             for key in src:
-                item = self.__copy(src[key], dest[key], dump_times,
-                                   current_path + key + "/")
+                item, shape = self.__copy(src[key], dest[key], dump_times,
+                                          current_path + key + "/")
                 if item is not None:
                     res.insert_component(key, item)
-            return res
+            return res, shape
         elif any([
                 isinstance(src, container_type)
                 for container_type in container_types
