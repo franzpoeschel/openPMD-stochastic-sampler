@@ -154,7 +154,8 @@ class loaded_chunks_record_component:
             assert chunks[i].extent == self.chunks[i].extent
 
         reset_dataset = True
-        offset = 0
+        offset = my_out_chunk.offset[0]
+
         for chunk in self.chunks:
             if reset_dataset:
                 chunk.dest_component.reset_dataset(
@@ -212,6 +213,7 @@ class loaded_chunks_species:
 
         my_out_chunk = io.ChunkInfo([communicator.rank * sample_size_per_rank],
                                     [sample_size_per_rank])
+        assert(total_size_this_rank >= sample_size_per_rank)
         random_sample = np.random.choice(range(total_size_this_rank),
                                          sample_size_per_rank)
 
@@ -406,6 +408,8 @@ class pipe:
                     in_iteration, out_iteration, dump_times,
                     current_path + str(in_iteration.iteration_index) + "/")
                 for species_name, species in loaded_chunks.particles.items():
+                    if not debug:
+                        break
                     print("Species {},\tloaded chunks:".format(species_name))
                     for chunk in species.chunks:
                         print("\t{}\tto {}".format(chunk.offset, chunk.extent))
@@ -423,7 +427,7 @@ class pipe:
                 in_iteration.close()
                 dump_times.now("Sampling iteration {}".format(
                     in_iteration.iteration_index))
-                loaded_chunks.sample(self.comm)
+                loaded_chunks.sample(self.comm, 0.005)
                 dump_times.now("Closing outgoing iteration {}".format(
                     in_iteration.iteration_index))
                 out_iteration.close()
