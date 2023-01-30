@@ -18,6 +18,7 @@ import openpmd_api as io
 
 
 class DumpTimes:
+
     def __init__(self, filename):
         self.last_time_point = int(time.time() * 1000)
         self.out_stream = open(filename, 'w')
@@ -128,23 +129,61 @@ class FallbackMPICommunicator:
 
 class loaded_chunk:
 
-    def __init__(self, dest_component, offset, extent, chunk):
+    def __init__(self, dest_component: io.Record_Component, offset, extent,
+                 chunk):
         self.dest_component = dest_component
         self.offset = offset
         self.extent = extent
         self.chunk = chunk
 
 
-class loaded_chunks:
+class loaded_chunks_record_component:
 
     def __init__(self):
-        self.chunks = {}
+        self.chunks = []
 
-    def append(self, component, entry):
-        if component in self.chunks:
-            self.chunks[component].append(entry)
-        else:
-            self.chunks[component] = [entry]
+    def append(self, entry: loaded_chunk):
+        self.chunks.append(entry)
+
+
+class loaded_chunks_record:
+
+    def __init__(self):
+        self.components = {}
+
+    # e.g. key = "x", "y", "z"
+    def insert_component(self, key: str,
+                         loaded_chunks: loaded_chunks_record_component):
+        self.components[key] = loaded_chunks
+
+    # @property
+    # def components(self):
+    #     return self._components
+
+    # @components.setter
+    # def components(self, components):
+    #     self._components = components
+
+
+class loaded_chunks_species:
+
+    def __init__(self):
+        self.records = {}
+        self.chunks = None
+
+    # e.g. key = "position", "positionOffset", ...
+    def insert_record(self, key: str, record: loaded_chunks_record):
+        self.records[key] = record
+
+
+class loaded_chunks_iteration:
+
+    def __init__(self):
+        self.particles = {}
+
+    def insert_particle_species(self, key: str,
+                                particle_species: loaded_chunks_species):
+        self.particles[key] = particle_species
 
 
 # class particle_patch_load:
@@ -216,7 +255,6 @@ class pipe:
         self.outfile = outfile
         self.inconfig = inconfig
         self.outconfig = outconfig
-        self.loaded_chunks = loaded_chunks()
         self.comm = comm
         if HAVE_MPI:
             hostinfo = io.HostInfo.HOSTNAME
@@ -316,12 +354,22 @@ class pipe:
                 out_iteration = write_iterations[in_iteration.iteration_index]
                 sys.stdout.flush()
                 self.__particle_patches = []
-                self.__copy(
+                loaded_chunks = self.__copy(
                     in_iteration, out_iteration, dump_times,
                     current_path + str(in_iteration.iteration_index) + "/")
-                for component, chunk_list in self.loaded_chunks.chunks.items():
-                    print("Loaded {} chunk(s) for component '{}'.".format(
-                        len(chunk_list), component))
+                for species_name, species in loaded_chunks.particles.items():
+                    print("Species {},\tloaded chunks:".format(species_name))
+                    for chunk in species.chunks:
+                        print("\t{}\tto {}".format(chunk.offset, chunk.extent))
+                    for record_name, record in species.records.items():
+                        print("\tRecord:", record_name)
+                        for component_name, component in record.components.items(
+                        ):
+                            print("\t\tComponent:", component_name)
+                            for chunk in component.chunks:
+                                print(
+                                    "\t\t\tLoaded chunk from {} to {}".format(
+                                        chunk.offset, chunk.extent))
                 dump_times.now("Closing incoming iteration {}".format(
                     in_iteration.iteration_index))
                 in_iteration.close()
@@ -334,7 +382,6 @@ class pipe:
                     in_iteration.iteration_index))
                 dump_times.flush()
                 self.__particle_patches.clear()
-                self.loaded_chunks.chunks.clear()
                 sys.stdout.flush()
         elif isinstance(src, io.Record_Component):
             shape = src.shape
@@ -343,17 +390,22 @@ class pipe:
             if src.empty:
                 # empty record component automatically created by
                 # dest.reset_dataset()
-                pass
+                return None
             elif src.constant:
                 dest.make_constant(src.get_attribute("value"))
+                return None
             else:
-                chunk_table = src.available_chunks()
-                strategy = distribution_strategy(shape, self.comm.rank,
-                                                 self.comm.size)
-                my_chunks = strategy.assign_chunks(chunk_table, self.inranks,
-                                                   self.outranks)
-                for chunk in my_chunks[
-                        self.comm.rank] if self.comm.rank in my_chunks else []:
+                if not self.__my_chunks__:
+                    chunk_table = src.available_chunks()
+                    strategy = distribution_strategy(shape, self.comm.rank,
+                                                     self.comm.size)
+                    assignment = strategy.assign_chunks(
+                        chunk_table, self.inranks, self.outranks)
+                    self.__my_chunks__ = assignment[
+                        self.comm.
+                        rank] if self.comm.rank in assignment else []
+                loaded_chunks = loaded_chunks_record_component()
+                for chunk in self.__my_chunks__:
                     if debug:
                         end = chunk.offset.copy()
                         for i in range(len(end)):
@@ -361,12 +413,11 @@ class pipe:
                         print("{}\t{}/{}:\t{} -- {}".format(
                             current_path, self.comm.rank, self.comm.size,
                             chunk.offset, end))
-                    self.loaded_chunks.append(
-                        current_path,
+                    loaded_chunks.append(
                         loaded_chunk(
                             dest, chunk.offset, chunk.extent,
-                            src.load_chunk(chunk.offset,
-                                        chunk.extent)))
+                            src.load_chunk(chunk.offset, chunk.extent)))
+                return loaded_chunks
         # elif isinstance(src, io.Patch_Record_Component):
         #     dest.reset_dataset(io.Dataset(src.dtype, src.shape))
         #     if self.comm.rank == 0:
@@ -375,18 +426,42 @@ class pipe:
         elif isinstance(src, io.Iteration):
             # self.__copy(src.meshes, dest.meshes, dump_times,
             #             current_path + "meshes/")
-            self.__copy(src.particles, dest.particles, dump_times,
-                        current_path + "particles/")
+            return self.__copy(src.particles, dest.particles, dump_times,
+                               current_path + "particles/")
+        elif isinstance(src, io.Particle_Container):
+            res = loaded_chunks_iteration()
+            for key in src:
+                item = self.__copy(src[key], dest[key], dump_times,
+                                   current_path + key + "/")
+                res.insert_particle_species(key, item)
+            return res
+        elif isinstance(src, io.ParticleSpecies):
+            res = loaded_chunks_species()
+            self.__my_chunks__ = None
+            for key in src:
+                item = self.__copy(src[key], dest[key], dump_times,
+                                   current_path + key + "/")
+                if item.components:
+                    res.insert_record(key, item)
+            # self.__copy(src.particle_patches, dest.particle_patches,
+            #                 dump_times)
+            res.chunks = self.__my_chunks__
+            self.__my_chunks__ = None
+            return res
+        elif isinstance(src, io.Record):
+            res = loaded_chunks_record()
+            for key in src:
+                item = self.__copy(src[key], dest[key], dump_times,
+                                   current_path + key + "/")
+                if item is not None:
+                    res.insert_component(key, item)
+            return res
         elif any([
                 isinstance(src, container_type)
                 for container_type in container_types
         ]):
-            for key in src:
-                self.__copy(src[key], dest[key], dump_times,
-                            current_path + key + "/")
-            # if isinstance(src, io.ParticleSpecies):
-            #     self.__copy(src.particle_patches, dest.particle_patches,
-            #                 dump_times)
+            raise RuntimeError("Unsupported openPMD container class: " +
+                               str(src))
         else:
             raise RuntimeError("Unknown openPMD class: " + str(src))
 
@@ -410,7 +485,8 @@ def main():
         loggingfile = "./PIPE_times_{}.txt".format(communicator.rank)
     else:
         loggingfile = "/dev/null"
-    print("Logging file on rank {} of {} is \"{}\".".format(communicator.rank, communicator.size, loggingfile))
+    print("Logging file on rank {} of {} is \"{}\".".format(
+        communicator.rank, communicator.size, loggingfile))
 
     run_pipe.run(loggingfile)
 
