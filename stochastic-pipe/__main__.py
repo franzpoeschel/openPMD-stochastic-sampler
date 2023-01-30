@@ -14,7 +14,7 @@ import re
 import sys  # sys.stderr.write
 import time
 
-from .. import openpmd_api_cxx as io
+import openpmd_api as io
 
 
 class DumpTimes:
@@ -120,39 +120,54 @@ debug = True
 
 
 class FallbackMPICommunicator:
+
     def __init__(self):
         self.size = 1
         self.rank = 0
 
 
-class deferred_load:
-    def __init__(self, source, dynamicView, offset, extent):
-        self.source = source
-        self.dynamicView = dynamicView
+class loaded_chunk:
+
+    def __init__(self, dest_component, offset, extent, chunk):
+        self.dest_component = dest_component
         self.offset = offset
         self.extent = extent
+        self.chunk = chunk
 
 
-class particle_patch_load:
-    """
-    A deferred load/store operation for a particle patch.
-    Our particle-patch API requires that users pass a concrete value for
-    storing, even if the actual write operation occurs much later at
-    series.flush().
-    So, unlike other record components, we cannot call .store_chunk() with
-    a buffer that has not yet been filled, but must wait until the point where
-    we actual have the data at hand already.
-    In short: calling .store() must be deferred, until the data has been fully
-    read from the sink.
-    This class stores the needed parameters to .store().
-    """
-    def __init__(self, data, dest):
-        self.data = data
-        self.dest = dest
+class loaded_chunks:
 
-    def run(self):
-        for index, item in enumerate(self.data):
-            self.dest.store(index, item)
+    def __init__(self):
+        self.chunks = {}
+
+    def append(self, component, entry):
+        if component in self.chunks:
+            self.chunks[component].append(entry)
+        else:
+            self.chunks[component] = [entry]
+
+
+# class particle_patch_load:
+#     """
+#     A deferred load/store operation for a particle patch.
+#     Our particle-patch API requires that users pass a concrete value for
+#     storing, even if the actual write operation occurs much later at
+#     series.flush().
+#     So, unlike other record components, we cannot call .store_chunk() with
+#     a buffer that has not yet been filled, but must wait until the point where
+#     we actual have the data at hand already.
+#     In short: calling .store() must be deferred, until the data has been fully
+#     read from the sink.
+#     This class stores the needed parameters to .store().
+#     """
+
+#     def __init__(self, data, dest):
+#         self.data = data
+#         self.dest = dest
+
+#     def run(self):
+#         for index, item in enumerate(self.data):
+#             self.dest.store(index, item)
 
 
 def distribution_strategy(dataset_extent,
@@ -195,12 +210,13 @@ class pipe:
     """
     Represents the configuration of one "pipe" pass.
     """
+
     def __init__(self, infile, outfile, inconfig, outconfig, comm):
         self.infile = infile
         self.outfile = outfile
         self.inconfig = inconfig
         self.outconfig = outconfig
-        self.loads = []
+        self.loaded_chunks = loaded_chunks()
         self.comm = comm
         if HAVE_MPI:
             hostinfo = io.HostInfo.HOSTNAME
@@ -278,12 +294,12 @@ class pipe:
                 dump_times.now("Received iteration {}".format(
                     in_iteration.iteration_index))
                 if self.comm.rank == 0:
-                    print("Iteration {0} contains {1} meshes:".format(
-                        in_iteration.iteration_index,
-                        len(in_iteration.meshes)))
-                    for m in in_iteration.meshes:
-                        print("\t {0}".format(m))
-                    print("")
+                    # print("Iteration {0} contains {1} meshes:".format(
+                    #     in_iteration.iteration_index,
+                    #     len(in_iteration.meshes)))
+                    # for m in in_iteration.meshes:
+                    #     print("\t {0}".format(m))
+                    # print("")
                     print(
                         "Iteration {0} contains {1} particle species:".format(
                             in_iteration.iteration_index,
@@ -303,15 +319,14 @@ class pipe:
                 self.__copy(
                     in_iteration, out_iteration, dump_times,
                     current_path + str(in_iteration.iteration_index) + "/")
-                for deferred in self.loads:
-                    deferred.source.load_chunk(
-                        deferred.dynamicView.current_buffer(), deferred.offset,
-                        deferred.extent)
+                for component, chunk_list in self.loaded_chunks.chunks.items():
+                    print("Loaded {} chunk(s) for component '{}'.".format(
+                        len(chunk_list), component))
                 dump_times.now("Closing incoming iteration {}".format(
                     in_iteration.iteration_index))
                 in_iteration.close()
-                for patch_load in self.__particle_patches:
-                    patch_load.run()
+                # for patch_load in self.__particle_patches:
+                #     patch_load.run()
                 dump_times.now("Closing outgoing iteration {}".format(
                     in_iteration.iteration_index))
                 out_iteration.close()
@@ -319,7 +334,7 @@ class pipe:
                     in_iteration.iteration_index))
                 dump_times.flush()
                 self.__particle_patches.clear()
-                self.loads.clear()
+                self.loaded_chunks.chunks.clear()
                 sys.stdout.flush()
         elif isinstance(src, io.Record_Component):
             shape = src.shape
@@ -346,17 +361,20 @@ class pipe:
                         print("{}\t{}/{}:\t{} -- {}".format(
                             current_path, self.comm.rank, self.comm.size,
                             chunk.offset, end))
-                    span = dest.store_chunk(chunk.offset, chunk.extent)
-                    self.loads.append(
-                        deferred_load(src, span, chunk.offset, chunk.extent))
-        elif isinstance(src, io.Patch_Record_Component):
-            dest.reset_dataset(io.Dataset(src.dtype, src.shape))
-            if self.comm.rank == 0:
-                self.__particle_patches.append(
-                    particle_patch_load(src.load(), dest))
+                    self.loaded_chunks.append(
+                        current_path,
+                        loaded_chunk(
+                            dest, chunk.offset, chunk.extent,
+                            src.load_chunk(chunk.offset,
+                                        chunk.extent)))
+        # elif isinstance(src, io.Patch_Record_Component):
+        #     dest.reset_dataset(io.Dataset(src.dtype, src.shape))
+        #     if self.comm.rank == 0:
+        #         self.__particle_patches.append(
+        #             particle_patch_load(src.load(), dest))
         elif isinstance(src, io.Iteration):
-            self.__copy(src.meshes, dest.meshes, dump_times,
-                        current_path + "meshes/")
+            # self.__copy(src.meshes, dest.meshes, dump_times,
+            #             current_path + "meshes/")
             self.__copy(src.particles, dest.particles, dump_times,
                         current_path + "particles/")
         elif any([
@@ -366,9 +384,9 @@ class pipe:
             for key in src:
                 self.__copy(src[key], dest[key], dump_times,
                             current_path + key + "/")
-            if isinstance(src, io.ParticleSpecies):
-                self.__copy(src.particle_patches, dest.particle_patches,
-                            dump_times)
+            # if isinstance(src, io.ParticleSpecies):
+            #     self.__copy(src.particle_patches, dest.particle_patches,
+            #                 dump_times)
         else:
             raise RuntimeError("Unknown openPMD class: " + str(src))
 
