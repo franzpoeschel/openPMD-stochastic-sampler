@@ -138,9 +138,25 @@ class loaded_chunk:
         self.chunk = chunk
 
 
+class scalar_record_component:
+
+    def __init__(self, datatype, value, out_component):
+        self.datatype = datatype
+        self.value = value
+        self.out_component = out_component
+        self.chunks = []
+
+    def sample(self, sample_size_total, *_):
+        self.out_component.reset_dataset(
+            io.Dataset(self.datatype, [sample_size_total]))
+        self.out_component.make_constant(self.value)
+
+
 class loaded_chunks_record_component:
 
-    def __init__(self):
+    def __init__(self, datatype, out_component):
+        self.datatype = datatype
+        self.out_component = out_component
         self.chunks = []
 
     def append(self, entry: loaded_chunk):
@@ -153,15 +169,12 @@ class loaded_chunks_record_component:
             assert chunks[i].offset == self.chunks[i].offset
             assert chunks[i].extent == self.chunks[i].extent
 
-        reset_dataset = True
         offset = my_out_chunk.offset[0]
 
+        self.out_component.reset_dataset(
+            io.Dataset(self.datatype, [sample_size_total]))
+
         for chunk in self.chunks:
-            if reset_dataset:
-                chunk.dest_component.reset_dataset(
-                    io.Dataset(chunk.dest_component.dtype,
-                               [sample_size_total]))
-                reset_dataset = False
             chunk_len = chunk.extent[0]
             filter_now = random_sample < chunk_len
             filter_next = random_sample >= chunk_len
@@ -213,7 +226,7 @@ class loaded_chunks_species:
 
         my_out_chunk = io.ChunkInfo([communicator.rank * sample_size_per_rank],
                                     [sample_size_per_rank])
-        assert(total_size_this_rank >= sample_size_per_rank)
+        assert (total_size_this_rank >= sample_size_per_rank)
         random_sample = np.random.choice(range(total_size_this_rank),
                                          sample_size_per_rank)
 
@@ -358,7 +371,8 @@ class pipe:
         ignored_attributes = {
             io.Series:
             ["basePath", "iterationEncoding", "iterationFormat", "openPMD"],
-            io.Iteration: ["snapshot"]
+            io.Iteration: ["snapshot"],
+            io.Record_Component: ["shape", "value"]
         }
         for key in src.attributes:
             ignore_this_attribute = False
@@ -427,7 +441,7 @@ class pipe:
                 in_iteration.close()
                 dump_times.now("Sampling iteration {}".format(
                     in_iteration.iteration_index))
-                loaded_chunks.sample(self.comm, 0.005)
+                loaded_chunks.sample(self.comm, 0.000002)
                 dump_times.now("Closing outgoing iteration {}".format(
                     in_iteration.iteration_index))
                 out_iteration.close()
@@ -439,14 +453,15 @@ class pipe:
         elif isinstance(src, io.Record_Component):
             shape = src.shape
             dtype = src.dtype
-            dest.reset_dataset(io.Dataset(dtype, shape))
             if src.empty:
                 # empty record component automatically created by
                 # dest.reset_dataset()
+                dest.reset_dataset(io.Dataset(dtype, shape))
                 return None, shape
             elif src.constant:
-                dest.make_constant(src.get_attribute("value"))
-                return None, shape
+                return scalar_record_component(dtype,
+                                               src.get_attribute("value"),
+                                               dest), shape
             else:
                 if not self.__my_chunks__:
                     chunk_table = src.available_chunks()
@@ -457,7 +472,7 @@ class pipe:
                     self.__my_chunks__ = assignment[
                         self.comm.
                         rank] if self.comm.rank in assignment else []
-                loaded_chunks = loaded_chunks_record_component()
+                loaded_chunks = loaded_chunks_record_component(dtype, dest)
                 for chunk in self.__my_chunks__:
                     if debug:
                         end = chunk.offset.copy()
