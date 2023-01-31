@@ -169,21 +169,27 @@ class loaded_chunks_record_component:
             assert chunks[i].offset == self.chunks[i].offset
             assert chunks[i].extent == self.chunks[i].extent
 
-        offset = my_out_chunk.offset[0]
-
         self.out_component.reset_dataset(
             io.Dataset(self.datatype, [sample_size_total]))
 
+        accumulator = 0
+        chunk_extents = []
         for chunk in self.chunks:
-            chunk_len = chunk.extent[0]
-            filter_now = random_sample < chunk_len
-            filter_next = random_sample >= chunk_len
-            filtered = chunk.chunk[random_sample[filter_now]]
-            chunk.dest_component.store_chunk(filtered, [offset],
-                                             [len(filtered)])
+            accumulator += chunk.extent[0]
+            chunk_extents.append(accumulator)
+        bins = np.digitize(random_sample, chunk_extents)
 
-            random_sample = random_sample[filter_next] - chunk_len
-            offset += len(filtered)
+        offset_out = my_out_chunk.offset[0]
+        offset_in = 0
+
+        for i in range(len(self.chunks)):
+            chunk = self.chunks[i]
+            filtered = chunk.chunk[random_sample[bins == i] - offset_in]
+            if filtered.any():
+                chunk.dest_component.store_chunk(filtered, [offset_out],
+                                                 [len(filtered)])
+            offset_out += len(filtered)
+            offset_in += chunk.extent[0]
 
 
 class loaded_chunks_record:
@@ -441,7 +447,7 @@ class pipe:
                 in_iteration.close()
                 dump_times.now("Sampling iteration {}".format(
                     in_iteration.iteration_index))
-                loaded_chunks.sample(self.comm, 0.000002)
+                loaded_chunks.sample(self.comm, 0.01)
                 dump_times.now("Closing outgoing iteration {}".format(
                     in_iteration.iteration_index))
                 out_iteration.close()
