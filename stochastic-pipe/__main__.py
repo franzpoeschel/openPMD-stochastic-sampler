@@ -237,7 +237,7 @@ class loaded_chunks_species:
                                          sample_size_per_rank,
                                          replace=False)
         # sort the indexes for a cache-friendlier access pattern later on
-        random_sample = np.sort(random_sample)
+        random_sample.sort()
 
         for _, record in self.records.items():
             record.sample(sample_size_total, my_out_chunk, random_sample,
