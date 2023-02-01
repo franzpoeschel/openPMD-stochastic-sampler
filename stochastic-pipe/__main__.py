@@ -233,8 +233,11 @@ class loaded_chunks_species:
         my_out_chunk = io.ChunkInfo([communicator.rank * sample_size_per_rank],
                                     [sample_size_per_rank])
         assert (total_size_this_rank >= sample_size_per_rank)
-        random_sample = np.random.choice(range(total_size_this_rank),
-                                         sample_size_per_rank)
+        random_sample = np.random.choice(np.arange(total_size_this_rank),
+                                         sample_size_per_rank,
+                                         replace=False)
+        # sort the indexes for a cache-friendlier access pattern later on
+        random_sample = np.sort(random_sample)
 
         for _, record in self.records.items():
             record.sample(sample_size_total, my_out_chunk, random_sample,
